@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: 拉取代码
@@ -19,38 +20,86 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 准备 Android SDK
+        run: |
+          set -e
+          if [ -d "/usr/local/lib/android/sdk" ]; then
+            echo "[*] 使用 runner 预装 SDK"
+            SDK="/usr/local/lib/android/sdk"
+          else
+            echo "[*] 预装 SDK 不存在，手动下载 commandline-tools"
+            SDK="$HOME/android-sdk"
+            mkdir -p "$SDK/cmdline-tools"
+            cd /tmp
+            curl -fsSL -o cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q cmdline-tools.zip -d "$SDK/cmdline-tools"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          fi
+
+          echo "ANDROID_HOME=$SDK"        >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK"    >> "$GITHUB_ENV"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools"      >> "$GITHUB_PATH"
+          echo "$SDK/cmake"               >> "$GITHUB_PATH"
+
+          ls -d "$SDK"/* 2>/dev/null || true
 
       - name: 安装 NDK 与构建工具
         run: |
+          set -e
+          which sdkmanager || echo "[!] sdkmanager 不在 PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125" \
-            "cmake;3.22.1"
+            "cmake;3.22.1" || {
+              echo "[!] 安装失败，输出当前 SDK 状态"
+              sdkmanager --list_installed || true
+              exit 1
+            }
+          echo "--- 已安装 ---"
+          sdkmanager --list_installed | sed -n '1,40p' || true
 
-      - name: 定位工程根目录
-        id: root
+      - name: 写入 local.properties
         run: |
-          if [ -f "gy_esp/settings.gradle" ]; then
-            echo "dir=gy_esp" >> "$GITHUB_OUTPUT"
-          else
-            echo "dir=." >> "$GITHUB_OUTPUT"
-          fi
+          set -e
+          if [ -f "gy_esp/settings.gradle" ]; then ROOT="gy_esp"; else ROOT="."; fi
+          echo "sdk.dir=$ANDROID_HOME" > "$ROOT/local.properties"
+          echo "ndk.dir=$ANDROID_HOME/ndk/26.1.10909125" >> "$ROOT/local.properties"
+          cat "$ROOT/local.properties"
 
       - name: 生成 Gradle Wrapper
-        working-directory: ${{ steps.root.outputs.dir }}
-        run: gradle wrapper --gradle-version 8.5
+        run: |
+          set -e
+          if [ -f "gy_esp/settings.gradle" ]; then ROOT="gy_esp"; else ROOT="."; fi
+          cd "$ROOT"
+          gradle wrapper --gradle-version 8.5 || {
+            echo "[!] 系统 gradle 不可用，手动下载"
+            curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.5-bin.zip
+            unzip -q /tmp/gradle.zip -d /tmp
+            /tmp/gradle-8.5/bin/gradle wrapper --gradle-version 8.5
+          }
 
       - name: 编译 Release APK
-        working-directory: ${{ steps.root.outputs.dir }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          set -e
+          if [ -f "gy_esp/settings.gradle" ]; then ROOT="gy_esp"; else ROOT="."; fi
+          cd "$ROOT"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace --info 2>&1 | tail -200
 
-      - name: 上传 APK 产物
+      - name: 定位产物
+        id: find
+        run: |
+          if [ -f "gy_esp/settings.gradle" ]; then ROOT="gy_esp"; else ROOT="."; fi
+          echo "dir=$ROOT" >> "$GITHUB_OUTPUT"
+          find "$ROOT/app/build/outputs" -name "*.apk" 2>/dev/null || true
+
+      - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
           name: sysmon-apk
-          path: ${{ steps.root.outputs.dir }}/app/build/outputs/apk/release/*.apk
+          path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
